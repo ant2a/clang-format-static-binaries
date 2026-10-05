@@ -1,0 +1,135 @@
+name: clang-format-static
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "LLVM version to build, e.g. 22.1.8"
+        required: true
+        default: "22.1.8"
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    env:
+      COMMON_CMAKE_ARGS: '-DBUILD_SHARED_LIBS=OFF -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra"'
+      VERSION: ${{ inputs.version || github.ref_name }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [linux, windows]
+        arch: [amd64]
+        include:
+          - os: linux
+            runner: ubuntu-22.04
+            os-cmake-args: '-DLLVM_BUILD_STATIC=ON -DCMAKE_CXX_FLAGS="-s -flto" -DCMAKE_BUILD_TYPE=MinSizeRel'
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-22.04-arm
+            os-cmake-args: '-DLLVM_BUILD_STATIC=ON -DCMAKE_CXX_FLAGS="-s -flto" -DCMAKE_BUILD_TYPE=MinSizeRel'
+          - os: windows
+            runner: windows-2022
+            os-cmake-args: '-Thost=x64 -DCMAKE_CXX_FLAGS="/MP /std:c++14" -DLLVM_USE_CRT_MINSIZEREL="MT"'
+            build-args: "--config MinSizeRel"
+
+    name: ${{ matrix.os }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout LLVM ${{ env.VERSION }}
+        uses: actions/checkout@v7
+        with:
+          repository: llvm/llvm-project
+          ref: llvmorg-${{ env.VERSION }}
+
+      - name: Configure
+        run: cmake -S llvm -B build ${{ env.COMMON_CMAKE_ARGS }} ${{ matrix.os-cmake-args }}
+
+      - name: Build
+        run: cmake --build build ${{ matrix.build-args }} -j2 --target clang-format
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+            name: clang-format-${{ env.VERSION }}-${{ matrix.os }}-${{ matrix.arch }}
+            path: |
+                build/bin/clang-format
+                build/MinSizeRel/bin/clang-format.exe
+            retention-days: 1
+            if-no-files-found: ignore
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    env:
+      VERSION: ${{ inputs.version || github.ref_name }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: clang-format-${{ env.VERSION }}-*
+          path: artifacts
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp artifacts/clang-format-${{ env.VERSION }}-linux-aarch64/bin/clang-format dist/clang-format-aarch64
+          cp artifacts/clang-format-${{ env.VERSION }}-linux-amd64/bin/clang-format dist/clang-format-amd64
+          cp artifacts/clang-format-${{ env.VERSION }}-windows-amd64/MinSizeRel/bin/clang-format.exe dist/clang-format-amd64.exe
+          cd dist
+          sha256sum clang-format-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/clang-format-*"
+
+      - name: Add attestation bundle to release assets
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" "dist/clang-format-$VERSION.intoto.jsonl"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Statically linked \`clang-format\` $VERSION binaries, built from [llvm/llvm-project](https://github.com/llvm/llvm-project) at tag \`llvmorg-$VERSION\`.
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 | \`clang-format-$VERSION-linux-amd64\` |
+          | Linux aarch64 | \`clang-format-$VERSION-linux-aarch64\` |
+          | Windows x86_64 | \`clang-format-$VERSION-windows-amd64.exe\` |
+
+          Every binary is covered by a [build provenance attestation](https://github.com/$GITHUB_REPOSITORY/attestations). Verify a download with:
+
+          \`\`\`sh
+          gh attestation verify <file> --repo $GITHUB_REPOSITORY
+          \`\`\`
+
+          Checksums are in \`SHA256SUMS.txt\`.
+          EOF
+          gh release create "$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "clang-format $VERSION" \
+            --notes-file notes.md \
+            --verify-tag
